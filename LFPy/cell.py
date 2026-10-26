@@ -170,13 +170,13 @@ class Cell(object):
             neuron.h.load_file('stdrun.hoc')  # NEURON stdrun library
 
         if delete_sections:
-            if not isinstance(morphology, type(neuron.h.SectionList)):
+            if not hasattr(morphology, "wholetree"):
                 if self.verbose:
                     print('%s existing sections deleted from memory' %
                           sum(1 for sec in neuron.h.allsec()))
                 neuron.h('forall delete_section()')
         else:
-            if not isinstance(morphology, type(neuron.h.SectionList)):
+            if not hasattr(morphology, "wholetree"):
                 mssg = "%s sections detected! " % sum(
                     1 for sec in neuron.h.allsec()) \
                     + "Consider setting 'delete_sections=True'"
@@ -197,9 +197,9 @@ class Cell(object):
             else:
                 raise Exception('non-existent file %s' % self.morphology)
         else:
-            assert isinstance(self.morphology, type(neuron.h.SectionList)), \
-                ("Could not recognize Cell keyword argument morphology as " +
-                 "neuron.h.SectionList instance")
+            if not hasattr(self.morphology, "wholetree"):
+                raise TypeError ("Could not recognize Cell keyword argument morphology as " +
+                                "neuron.h.SectionList instance")
 
             # instantiate 3D geometry of all sections
             neuron.h.define_shape()
@@ -308,15 +308,15 @@ class Cell(object):
 
     def strip_hoc_objects(self):
         """Destroy any NEURON hoc objects in the cell object"""
-        if not (isinstance(neuron, type(None)) or
-                isinstance(neuron.nrn, type(None))):
-            nrntypes = (neuron.nrn.Segment, neuron.nrn.Section,
-                        neuron.nrn.Mechanism, type(neuron.h.List()))
-            for key in self.__dict__.keys():
-                if isinstance(getattr(self, key), nrntypes):
-                    setattr(self, key, None)
-                    if self.verbose:
-                        print('{}.{} = None'.format(self.__name__, key))
+        for key, val in list(self.__dict__.items()):
+            try:
+                hoc_type = neuron.hoc.HocObject
+            except AttributeError:
+                hoc_type = None
+            if (hoc_type is not None) and isinstance(val, hoc_type):
+                setattr(self, key, None)
+                if self.verbose:
+                    print('{}.{} = None'.format("self", key))
 
     def _load_geometry(self):
         """Load the morphology-file in NEURON"""
@@ -413,7 +413,7 @@ class Cell(object):
         """Create section lists for different kinds of sections"""
         # list with all sections
         self.allsecnames = []
-        if not isinstance(self.morphology, type(neuron.h.SectionList)):
+        if not hasattr(self.morphology, "wholetree"):
             self.allseclist = neuron.h.SectionList()
             for sec in neuron.h.allsec():
                 self.allsecnames.append(sec.name())
@@ -2227,7 +2227,7 @@ class Cell(object):
         # calculate angles
         dx = np.diff(x)
         dz = np.diff(z)
-        theta = np.arctan2(dz, dx)
+        theta = np.arctan2(dz, dx)[0]
 
         x = np.r_[x, x[::-1]]
         z = np.r_[z, z[::-1]]
@@ -2433,14 +2433,16 @@ class Cell(object):
                      self.y[:, -1] - self.y.mean(axis=-1),
                      self.z[:, -1] - self.z.mean(axis=-1)]
 
-        # children_dict = self.get_dict_of_children_idx()
+        self.children_dict = self.get_dict_of_children_idx()
+        self.connection_dict = self.get_dict_parent_connections()
+
         for sec in self.allseclist:
             if not neuron.h.SectionRef(sec=sec).has_parent():
                 if sec.nseg == 1:
                     # skip soma, since soma is an orphan
                     continue
                 else:
-                    # the first segment has more than one segment,
+                    # the first section has more than one segment,
                     # need to compute axial currents within this section.
                     seg_idx = 1
                     parent_idx = 0
@@ -2448,8 +2450,6 @@ class Cell(object):
                     first_sec = True
                     branch = False
                     parentsec = None
-                    children_dict = None
-                    connection_dict = None
                     conn_point = 1
             else:
                 # section has parent section
@@ -2458,10 +2458,8 @@ class Cell(object):
                 secref = neuron.h.SectionRef(sec=sec)
                 parentseg = secref.parent()
                 parentsec = parentseg.sec
-                children_dict = self.get_dict_of_children_idx()
-                branch = len(children_dict[parentsec.name()]) > 1
-                connection_dict = self.get_dict_parent_connections()
-                conn_point = connection_dict[sec.name()]
+                branch = len(self.children_dict[parentsec.name()]) > 1
+                conn_point = self.connection_dict[sec.name()]
                 # find parent index
                 if conn_point == 1 or parentsec.nseg == 1:
                     internal_parent_idx = -1  # last seg in sec
@@ -2486,8 +2484,6 @@ class Cell(object):
                                                               bottom_seg,
                                                               branch,
                                                               parentsec,
-                                                              children_dict,
-                                                              connection_dict,
                                                               conn_point,
                                                               timepoints,
                                                               sec
@@ -2599,7 +2595,6 @@ class Cell(object):
 
     def _parent_and_segment_current(self, seg_idx, parent_idx, bottom_seg,
                                     branch=False, parentsec=None,
-                                    children_dict=None, connection_dict=None,
                                     conn_point=1, timepoints=None, sec=None):
         """
         Return axial current from segment (seg_idx) mid to segment start,
@@ -2615,10 +2610,6 @@ class Cell(object):
         branch: boolean
         parentsec: neuron.Section object
             parent section
-        children_dict: dict or None
-            Default None
-        connection_dict: dict or None
-            Default None
         conn_point: float
             relative connection point on section in the interval [0, 1].
             Defaults to 1
@@ -2659,16 +2650,16 @@ class Cell(object):
                 ipar = iseg
             else:
                 # if branch, need to compute iseg and ipar separately
-                [sib_idcs] = np.take(children_dict[parentsec.name()],
-                                     np.where(children_dict[parentsec.name()]
-                                              != seg_idx))
+                [sib_idcs] = np.take(
+                    self.children_dict[parentsec.name()],
+                    np.where(self.children_dict[parentsec.name()] != seg_idx))
                 sibs = [self.get_idx_name(sib_idcs)[i][1]
                         for i in range(len(sib_idcs))]
                 # compute potential in branch point between parent and siblings
                 v_branch_num = vpar / parent_ri + vseg / seg_ri
                 v_branch_denom = 1. / parent_ri + 1. / seg_ri
                 for sib_idx, sib in zip(sib_idcs, sibs):
-                    sib_conn_point = connection_dict[sib]
+                    sib_conn_point = self.connection_dict[sib]
                     if sib_conn_point == conn_point:
                         v_branch_num += vmem[sib_idx] / self._ri_list[sib_idx]
                         v_branch_denom += 1. / self._ri_list[sib_idx]
